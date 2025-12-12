@@ -6,6 +6,7 @@ import (
 	"crypto/sha512"
 	"errors"
 	"fmt"
+	"math/big"
 	"reflect"
 	"strings"
 
@@ -114,4 +115,106 @@ func SSHPublicKeyToAge(sshKey []byte) (*string, error) {
 		return nil, errors.New("BUG! public key does not implement ssh.CryptoPublicKey")
 	}
 	return encodePublicKey(cpk.CryptoPublicKey())
+}
+
+func AgeToSSH(ageKey string) ([]string, error) {
+	ageKey = strings.TrimSpace(ageKey)
+	if ageKey == "" {
+		return nil, nil
+	}
+
+	hrp, data, err := bech32.Decode(ageKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode key %s: %v", ageKey, err)
+	}
+
+	if hrp != "age" {
+		return nil, fmt.Errorf("invalid HRP: expected \"age\", got \"%s\"", hrp)
+	}
+
+	if len(data) != 32 {
+		return nil, fmt.Errorf("invalid key length: expected 32 bytes, got %d", len(data))
+	}
+
+	// Convert Curve25519 (Montgomery) u to Ed25519 (Edwards) y
+	// y = (u - 1) / (u + 1) mod p
+	// p = 2^255 - 19
+
+	// data is little-endian u coordinate. Convert to big-endian for big.Int
+	uBytes := make([]byte, 32)
+	copy(uBytes, data)
+	reverse(uBytes)
+	u := new(big.Int).SetBytes(uBytes)
+
+	p, _ := new(big.Int).SetString("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed", 16)
+
+	one := big.NewInt(1)
+
+	// num = u - 1
+	num := new(big.Int).Sub(u, one)
+
+	// den = u + 1
+	den := new(big.Int).Add(u, one)
+
+	// invDen = den^-1 mod p
+	invDen := new(big.Int).ModInverse(den, p)
+
+	if invDen == nil {
+		return nil, fmt.Errorf("singular point (u=-1)")
+	}
+
+	// y = num * invDen mod p
+	y := new(big.Int).Mul(num, invDen)
+	y.Mod(y, p)
+
+	// Convert y to 32 bytes little-endian
+	yBytes := y.Bytes()
+	// Pad to 32 bytes if necessary (big.Int.Bytes() returns minimal byte slice)
+	if len(yBytes) < 32 {
+		padding := make([]byte, 32-len(yBytes))
+		yBytes = append(padding, yBytes...)
+	}
+
+	// big.Int.Bytes() returns big-endian. We need little-endian for Ed25519.
+	reverse(yBytes)
+
+	// Candidate 1: sign bit 0
+	pubKey1 := make([]byte, 32)
+	copy(pubKey1, yBytes)
+	// The highest bit of the last byte is already 0 because p < 2^255
+
+	// Candidate 2: sign bit 1
+	pubKey2 := make([]byte, 32)
+	copy(pubKey2, yBytes)
+	pubKey2[31] |= 0x80
+
+	sshKey1, err := formatSSHKey(pubKey1)
+	if err != nil {
+		return nil, err
+	}
+	sshKey2, err := formatSSHKey(pubKey2)
+	if err != nil {
+		return nil, err
+	}
+
+	return []string{sshKey1, sshKey2}, nil
+}
+
+func reverse(b []byte) {
+	for i, j := 0, len(b)-1; i < j; i, j = i+1, j-1 {
+		b[i], b[j] = b[j], b[i]
+	}
+}
+
+func formatSSHKey(pubKeyBytes []byte) (string, error) {
+	pk := ed25519.PublicKey(pubKeyBytes)
+
+	sshPub, err := ssh.NewPublicKey(pk)
+	if err != nil {
+		return "", fmt.Errorf("failed to create SSH public key: %v", err)
+	}
+
+	// ssh.MarshalAuthorizedKey appends a newline
+	keyStr := string(ssh.MarshalAuthorizedKey(sshPub))
+	return strings.TrimSpace(keyStr), nil
 }
